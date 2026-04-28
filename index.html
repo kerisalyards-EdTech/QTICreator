@@ -1121,39 +1121,101 @@ function parseText2QTI(text) {
   const questions = [];
   const lines = bodyText.split('\n');
   let current = null;
+  let autoNum = 0; // used when questions have no numbers
 
-  for (const line of lines) {
-    const trimmed = line.trim();
-    if (trimmed.startsWith('#') || (trimmed === '' && !current)) continue;
+  // A line is a choice if it starts with optional * then a single letter then ) . : or space
+  const isChoiceLine = t => /^(\*?)([a-eA-E])[).:\s]\s*\S/.test(t);
+  // A line is a numbered question: "1. text" or "1) text"
+  const isNumberedQ = t => /^(\d+)[.)]\s+\S/.test(t);
+  // A line looks like a question: not a choice, not blank, not a comment
+  const looksLikeQuestion = t => t.length > 0 && !t.startsWith('#') && !isChoiceLine(t) && !/^(\*?)([a-eA-E])[).:\s]/.test(t);
 
-    const qMatch = trimmed.match(/^(\d+)\.\s+(.+)/);
-    if (qMatch) {
-      if (current) questions.push(current);
-      current = { number: parseInt(qMatch[1]), text: qMatch[2], choices: [], type: 'essay', correctIndex: -1 };
-      continue;
+  function pushCurrent() {
+    if (current) questions.push(current);
+  }
+
+  function newQuestion(text, number) {
+    pushCurrent();
+    current = { number, text, choices: [], type: 'essay', correctIndex: -1 };
+  }
+
+  function addChoice(trimmed) {
+    const m = trimmed.match(/^(\*?)([a-eA-E])[).:\s]\s*(.+)/);
+    if (!m) return false;
+    const isCorrect = m[1] === '*';
+    const idx = current.choices.length;
+    if (isCorrect) current.correctIndex = idx;
+    current.choices.push({ text: m[3].trim(), correct: isCorrect });
+    if (current.choices.length === 2 &&
+        current.choices[0].text.match(/^true$/i) &&
+        current.choices[1].text.match(/^false$/i)) {
+      current.type = 'true_false';
+    } else {
+      current.type = 'multiple_choice';
     }
-    if (!current) continue;
+    return true;
+  }
 
-    const choiceMatch = trimmed.match(/^(\*?)([a-zA-F])[).:\s]\s*(.+)/);
-    if (choiceMatch) {
-      const isCorrect = choiceMatch[1] === '*';
-      const idx = current.choices.length;
-      if (isCorrect) current.correctIndex = idx;
-      current.choices.push({ text: choiceMatch[3], correct: isCorrect });
-      if (current.choices.length === 2 &&
-          current.choices[0].text.match(/^true$/i) &&
-          current.choices[1].text.match(/^false$/i)) {
-        current.type = 'true_false';
-      } else if (current.choices.length > 0) {
-        current.type = 'multiple_choice';
+  for (let i = 0; i < lines.length; i++) {
+    const line  = lines[i];
+    const trimmed = line.trim();
+
+    if (!trimmed || trimmed.startsWith('#')) {
+      // A blank line while we have a current question with choices = question is done
+      // (only close if we actually have choices, so multi-line question text still works)
+      if (trimmed === '' && current && current.choices.length > 0) {
+        // peek ahead: if next non-blank line is NOT a choice, close the question
+        let nextContent = '';
+        for (let j = i + 1; j < lines.length; j++) {
+          if (lines[j].trim()) { nextContent = lines[j].trim(); break; }
+        }
+        if (nextContent && !isChoiceLine(nextContent)) {
+          pushCurrent();
+          current = null;
+        }
       }
       continue;
     }
-    if (trimmed === '[]' || trimmed === '____' || trimmed === '___') { current.type = 'short_answer'; continue; }
-    if (trimmed && current.choices.length === 0) current.text += ' ' + trimmed;
-  }
-  if (current) questions.push(current);
 
+    // ── Numbered question: "1. text" or "1) text" ──
+    const numMatch = trimmed.match(/^(\d+)[.)]\s+(.+)/);
+    if (numMatch) {
+      autoNum = parseInt(numMatch[1]);
+      newQuestion(numMatch[2], autoNum);
+      continue;
+    }
+
+    // ── Choice line ──
+    if (isChoiceLine(trimmed)) {
+      // If we have no current question yet, something went wrong — skip
+      if (!current) continue;
+      addChoice(trimmed);
+      continue;
+    }
+
+    // ── Essay/short-answer blank marker ──
+    if (trimmed === '[]' || trimmed === '____' || trimmed === '___') {
+      if (current) current.type = 'short_answer';
+      continue;
+    }
+
+    // ── Everything else: treat as a question stem ──
+    // If current question already has choices, this is a new unnumbered question
+    if (current && current.choices.length > 0) {
+      autoNum++;
+      newQuestion(trimmed, autoNum);
+    } else if (current && current.choices.length === 0) {
+      // continuation of a multi-line question stem
+      current.text += ' ' + trimmed;
+    } else {
+      // No current question at all — start a new unnumbered one
+      autoNum++;
+      newQuestion(trimmed, autoNum);
+    }
+  }
+  pushCurrent();
+
+  // Apply answer key
   if (hasAnswerKey) {
     questions.forEach(q => {
       if (q.correctIndex === -1 && answerMap[q.number] !== undefined) {
@@ -1162,12 +1224,18 @@ function parseText2QTI(text) {
           q.correctIndex = ki;
           q.choices.forEach((c, ci) => { c.correct = ci === ki; });
           if (q.type === 'essay' && q.choices.length > 0)
-            q.type = (q.choices.length === 2 && q.choices[0].text.match(/^true$/i) && q.choices[1].text.match(/^false$/i))
+            q.type = (q.choices.length === 2 &&
+                      q.choices[0].text.match(/^true$/i) &&
+                      q.choices[1].text.match(/^false$/i))
               ? 'true_false' : 'multiple_choice';
         }
       }
     });
   }
+
+  // Re-number sequentially regardless of source numbering
+  questions.forEach((q, i) => { q.number = i + 1; });
+
   return questions.filter(q => q.text);
 }
 
